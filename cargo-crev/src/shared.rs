@@ -5,10 +5,10 @@ use crate::{
     edit, opts,
     opts::CrateSelector,
     prelude::*,
-    repo::*,
+    repo::Repo,
 };
 use anyhow::{format_err, Context, Result};
-use crev_data::{proof, review::Package};
+use crev_data::{proof, review::Package, SOURCE_CRATES_IO};
 use crev_lib::{self, local::Local, ProofStore, ReviewMode};
 use resiter::FlatMap;
 use serde::Deserialize;
@@ -31,9 +31,6 @@ pub const GOTO_CRATE_VERSION_ENV: &str = "CARGO_CREV_GOTO_ORIGINAL_VERSION";
 /// Name of file we store user-personalized
 pub const KNOWN_CARGO_OWNERS_FILE: &str = "known_cargo_owners.txt";
 
-/// Constant we use for `source` in the review proof
-pub const PROJECT_SOURCE_CRATES_IO: &str = "https://crates.io";
-
 /// The file added to crates containing vcs revision
 pub const VCS_INFO_JSON_FILE: &str = ".cargo_vcs_info.json";
 
@@ -44,8 +41,7 @@ pub struct VcsInfoJson {
 }
 
 pub fn vcs_info_to_revision_string(vcs: Option<VcsInfoJson>) -> String {
-    vcs.and_then(|vcs| vcs.get_git_revision())
-        .unwrap_or_default()
+    vcs.map(|vcs| vcs.get_git_revision()).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,9 +62,9 @@ impl VcsInfoJson {
             Ok(None)
         }
     }
-    fn get_git_revision(&self) -> Option<String> {
+    fn get_git_revision(&self) -> String {
         let VcsInfoJsonGit::Sha1(ref s) = self.git;
-        Some(s.to_string())
+        s.to_string()
     }
 }
 
@@ -127,7 +123,7 @@ pub fn goto_crate_src(selector: &opts::CrateSelector) -> Result<()> {
     let crate_version = crate_.version();
     let local = crev_lib::Local::auto_create_or_open()?;
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         &crate_.name(),
         crate_version,
         &crev_lib::ReviewActivity::new_full(),
@@ -289,14 +285,14 @@ pub fn crate_open(crate_sel: &CrateSelector, cmd: Option<String>, cmd_save: bool
 
     // It's not safe to open Cargo's crate dir directly, because editor integration (like cargo check)
     // could automatically start running crate's potentially malicious build script or proc macros.
-    let dest_dir = local.sanitized_crate_copy(PROJECT_SOURCE_CRATES_IO, &name, version, src_dir)?;
+    let dest_dir = local.sanitized_crate_copy(SOURCE_CRATES_IO, &name, version, src_dir)?;
 
     let open_cmd = match cmd {
         Some(cmd) => cmd,
         None => get_open_cmd(&local)?,
     };
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         &name,
         version,
         &crev_lib::ReviewActivity::new_full(),
@@ -359,7 +355,7 @@ pub fn crate_review_activity_check(
     diff: &Option<Option<Version>>,
     skip_activity_check: bool,
 ) -> Result<Option<Version>, ActivityCheckError> {
-    let activity = local.read_review_activity(PROJECT_SOURCE_CRATES_IO, name, version)?;
+    let activity = local.read_review_activity(SOURCE_CRATES_IO, name, version)?;
 
     let diff = match diff {
         None => None,
@@ -463,11 +459,7 @@ pub fn find_advisories(crate_: &opts::CrateSelector) -> Result<Vec<proof::review
     let db = local.load_db()?;
 
     Ok(db
-        .get_advisories(
-            PROJECT_SOURCE_CRATES_IO,
-            crate_.name.as_deref(),
-            crate_.version()?,
-        )
+        .get_advisories(SOURCE_CRATES_IO, crate_.name.as_deref(), crate_.version()?)
         .cloned()
         .collect())
 }
@@ -493,7 +485,7 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
         .or_else(|| {
             crev_lib::find_latest_trusted_version(
                 &trust_set,
-                PROJECT_SOURCE_CRATES_IO,
+                SOURCE_CRATES_IO,
                 name,
                 &requirements,
                 &db,
@@ -504,7 +496,7 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
     let src_crate = repo.get_crate(&src_crate_id)?;
 
     local.record_review_activity(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         name,
         dst_crate.version(),
         &crev_lib::ReviewActivity::new_diff(&src_version),
@@ -539,7 +531,7 @@ pub fn run_diff(args: &opts::Diff) -> Result<std::process::ExitStatus> {
             let mut command = diff(diff_exe.as_os_str());
             command
                 .status()
-                .or_else(|err| panic!("Failed to execute {command:?}\n{err:?}"))
+                .map_err(|err| panic!("Failed to execute {command:?}\n{err:?}"))
         }
         Err(ref err) => panic!("Failed to execute {command:?}\n{err:?}"),
         Ok(status) => Ok(status),
@@ -574,7 +566,7 @@ pub fn list_issues(args: &opts::RepoQueryIssue) -> Result<()> {
     let trust_set = db.calculate_trust_set(&current_id, &trust_distance_params);
 
     for review in db.get_pkg_reviews_with_issues_for(
-        PROJECT_SOURCE_CRATES_IO,
+        SOURCE_CRATES_IO,
         args.crate_.name.as_deref(),
         args.crate_.version()?,
         &trust_set,
@@ -661,7 +653,7 @@ pub fn get_geiger_count(path: &Path) -> Result<u64> {
             + counters.exprs.unsafe_
             + counters.item_impls.unsafe_
             + counters.item_traits.unsafe_
-            + counters.methods.unsafe_
+            + counters.methods.unsafe_;
     }
 
     Ok(count)
@@ -686,7 +678,7 @@ pub fn get_crate_digest_mismatches(
     version: &Version,
     digest: &crev_data::Digest,
 ) -> Vec<Package> {
-    db.get_package_reviews_for_package(PROJECT_SOURCE_CRATES_IO, Some(name), Some(version))
+    db.get_package_reviews_for_package(SOURCE_CRATES_IO, Some(name), Some(version))
         .filter(|review| review.package.digest != digest.as_slice())
         .cloned()
         .collect()
@@ -745,11 +737,7 @@ pub fn lookup_crates(query: &str, count: usize) -> Result<()> {
         .map(|crate_| CrateStats {
             name: crate_.name.clone(),
             downloads: crate_.downloads,
-            proof_count: db.get_package_review_count(
-                PROJECT_SOURCE_CRATES_IO,
-                Some(&crate_.name),
-                None,
-            ),
+            proof_count: db.get_package_review_count(SOURCE_CRATES_IO, Some(&crate_.name), None),
         })
         .collect();
 

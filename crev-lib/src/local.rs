@@ -2,7 +2,7 @@ use crate::{
     activity::ReviewActivity,
     id::{self, LockedId, PassphraseFn},
     util::{self, git::is_unrecoverable},
-    Error, ProofStore, Result,
+    Error, ProofStore, Result, Warning,
 };
 use crev_common::{
     self, sanitize_name_for_fs, sanitize_url_for_fs,
@@ -11,12 +11,12 @@ use crev_common::{
 use crev_data::{
     id::UnlockedId,
     proof::{self, trust::TrustLevel, OverrideItem},
-    Id, PublicId, Url,
+    Id, PublicId, RegistrySource, Url,
 };
 use default::default;
 use directories::ProjectDirs;
 use log::{debug, error, info, warn};
-use resiter::*;
+use resiter::{FilterMap, Map};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -90,6 +90,7 @@ impl UserConfig {
     pub fn get_current_userid(&self) -> Result<&Id> {
         self.get_current_userid_opt().ok_or(Error::CurrentIDNotSet)
     }
+
     #[must_use]
     pub fn get_current_userid_opt(&self) -> Option<&Id> {
         self.current_id.as_ref()
@@ -108,6 +109,7 @@ pub struct Local {
 }
 
 impl Local {
+    /// Load config from the environment
     #[allow(clippy::new_ret_no_self)]
     fn new() -> Result<Self> {
         let proj_dir = match std::env::var_os("CARGO_CREV_ROOT_DIR_OVERRIDE") {
@@ -125,6 +127,22 @@ impl Local {
             cur_url: Mutex::new(None),
             user_config: Mutex::new(None),
         })
+    }
+
+    /// Load all reviews and trust proofs for the current user
+    pub fn load_db(&self) -> Result<crev_wot::ProofDB> {
+        let mut db = crev_wot::ProofDB::new();
+        for local_id in self.get_current_user_public_ids()? {
+            db.record_trusted_url_from_own_id(&local_id);
+        }
+        db.import_from_iter(
+            self.all_local_proofs()
+                .map(move |p| (p, crev_wot::FetchSource::LocalUser)),
+        );
+        db.import_from_iter(proofs_iter_for_remotes_checkouts(
+            self.cache_remotes_path(),
+        )?);
+        Ok(db)
     }
 
     /// Where the config is stored
@@ -285,7 +303,7 @@ impl Local {
                 let path = dir_entry?.path();
                 if path.extension().map_or(false, |ext| ext == "yaml") {
                     let locked_id = LockedId::read_from_yaml_file(&path)?;
-                    ids.push(locked_id.to_public_id())
+                    ids.push(locked_id.to_public_id());
                 }
             }
         }
@@ -311,7 +329,7 @@ impl Local {
     /// Path where to put copies of crates' source code
     fn sanitized_crate_path(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         version: &crev_data::Version,
     ) -> PathBuf {
@@ -324,7 +342,7 @@ impl Local {
     /// Copy crate for review, neutralizing hidden or dangerous files
     pub fn sanitized_crate_copy(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         version: &crev_data::Version,
         src_dir: &Path,
@@ -344,7 +362,7 @@ impl Local {
     /// Yaml file path for in-progress review metadata
     fn cache_review_activity_path(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         version: &crev_data::Version,
     ) -> PathBuf {
@@ -359,7 +377,7 @@ impl Local {
     /// Save activity (in-progress review) to disk
     pub fn record_review_activity(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         version: &crev_data::Version,
         activity: &ReviewActivity,
@@ -375,7 +393,7 @@ impl Local {
     /// Load activity (in-progress review) from disk
     pub fn read_review_activity(
         &self,
-        source: &str,
+        source: RegistrySource<'_>,
         name: &str,
         version: &crev_data::Version,
     ) -> Result<Option<ReviewActivity>> {
@@ -499,6 +517,7 @@ impl Local {
         id: &mut id::LockedId,
         git_https_url: &str,
         use_https_push: bool,
+        warnings: &mut Vec<Warning>,
     ) -> Result<()> {
         self.ensure_proofs_root_exists()?;
 
@@ -516,14 +535,17 @@ impl Local {
             }
         }
 
-        self.clone_proof_dir_from_git(git_https_url, use_https_push)?;
+        self.clone_proof_dir_from_git(git_https_url, use_https_push, warnings)?;
 
         id.url = Some(new_url);
         self.save_locked_id(id)?;
 
         // commit uncommitted changes, if there are any. Otherwise the next pull may fail
         let _ = self.proof_dir_commit("Setting up new CrevID URL");
-        let _ = self.run_git(vec!["pull".into(), "--rebase".into(), "-Xours".into()]);
+        let _ = self.run_git(
+            vec!["pull".into(), "--rebase".into(), "-Xours".into()],
+            warnings,
+        );
         Ok(())
     }
 
@@ -533,7 +555,7 @@ impl Local {
         id.save_to(&path)
     }
 
-    fn init_local_proofs_repo(&self, id: &Id) -> Result<()> {
+    fn init_local_proofs_repo(&self, id: &Id, warnings: &mut Vec<Warning>) -> Result<()> {
         self.ensure_proofs_root_exists()?;
 
         let proof_dir = self.local_proofs_repo_path_for_id(id);
@@ -546,11 +568,14 @@ impl Local {
         }
         if let Err(e) = git2::Repository::init(&proof_dir) {
             warn!("Can't init repo in {}: {}", proof_dir.display(), e);
-            self.run_git(vec![
-                "init".into(),
-                "--initial-branch=master".into(),
-                proof_dir.into(),
-            ])?;
+            self.run_git(
+                vec![
+                    "init".into(),
+                    "--initial-branch=master".into(),
+                    proof_dir.into(),
+                ],
+                warnings,
+            )?;
         }
         Ok(())
     }
@@ -562,6 +587,7 @@ impl Local {
         &self,
         git_https_url: &str,
         use_https_push: bool,
+        warnings: &mut Vec<Warning>,
     ) -> Result<()> {
         debug_assert!(git_https_url.starts_with("https://"));
         if git_https_url.starts_with("https://github.com/crev-dev/crev-proofs") {
@@ -580,12 +606,8 @@ impl Local {
             match util::git::https_to_git_url(git_https_url) {
                 Some(git_url) => git_url,
                 None => {
-                    warn!(
-                        "Could not deduce `ssh` push url. Call:\n\
-                           cargo crev repo git remote set-url --push origin <url>\n\
-                           manually after the id is generated."
-                    );
-                    git_https_url.to_string()
+                    warnings.push(Warning::GitPushUrl(git_https_url.into()));
+                    git_https_url.into()
                 }
             }
         };
@@ -833,6 +855,7 @@ impl Local {
         &self,
         trust_params: crate::TrustDistanceParams,
         for_id: Option<&str>,
+        warnings: &mut Vec<Warning>,
     ) -> Result<()> {
         let mut already_fetched_ids = HashSet::new();
         let mut already_fetched_urls = remotes_checkouts_iter(self.cache_remotes_path())?
@@ -843,12 +866,14 @@ impl Local {
 
         loop {
             let trust_set = db.calculate_trust_set(&for_id, &trust_params);
-            if !self.fetch_ids_not_fetched_yet(
+            let fetched_new = self.fetch_ids_not_fetched_yet(
                 trust_set.iter_trusted_ids().cloned(),
                 &mut already_fetched_ids,
                 &mut already_fetched_urls,
                 &mut db,
-            ) {
+                warnings,
+            );
+            if !fetched_new {
                 break;
             }
         }
@@ -860,6 +885,7 @@ impl Local {
         &self,
         trust_params: crate::TrustDistanceParams,
         for_id: Option<&str>,
+        warnings: &mut Vec<Warning>,
     ) -> Result<()> {
         let mut already_fetched_ids = HashSet::new();
         let mut already_fetched_urls = HashSet::new();
@@ -873,6 +899,7 @@ impl Local {
                 &mut already_fetched_ids,
                 &mut already_fetched_urls,
                 &mut db,
+                warnings,
             ) {
                 break;
             }
@@ -885,6 +912,7 @@ impl Local {
         &self,
         mut already_fetched_urls: HashSet<String>,
         db: &mut crev_wot::ProofDB,
+        warnings: &mut Vec<Warning>,
     ) -> Result<()> {
         let mut already_fetched_ids = HashSet::new();
 
@@ -894,6 +922,7 @@ impl Local {
                 &mut already_fetched_ids,
                 &mut already_fetched_urls,
                 db,
+                warnings,
             ) {
                 break;
             }
@@ -908,6 +937,7 @@ impl Local {
         already_fetched_ids: &mut HashSet<Id>,
         already_fetched_urls: &mut HashSet<String>,
         db: &mut crev_wot::ProofDB,
+        warnings: &mut Vec<Warning>,
     ) -> bool {
         use std::sync::mpsc::channel;
 
@@ -939,7 +969,7 @@ impl Local {
                     });
                     already_fetched_urls.insert(url.clone());
                 } else {
-                    warn!("URL for {} is not known yet", id);
+                    warnings.push(Warning::IdUrlNotKnonw(id.clone()));
                 }
                 already_fetched_ids.insert(id);
             }
@@ -955,7 +985,7 @@ impl Local {
                     }
                 };
                 if let Err(e) = self.import_proof_dir_and_print_counts(&dir, &url, db) {
-                    error!("Error: Failed to fetch {}: {} ({})", url, e, dir.display());
+                    warnings.push(Warning::FetchError(url, e, dir));
                     continue;
                 }
                 something_was_fetched = true;
@@ -1056,17 +1086,19 @@ impl Local {
 
     /// Fetch and discover proof repos. Like `fetch_all_ids_recursively`,
     /// but adds `https://github.com/dpc/crev-proofs` and repos in cache that didn't belong to any Ids.
-    pub fn fetch_all(&self) -> Result<()> {
+    pub fn fetch_all(&self, warnings: &mut Vec<Warning>) -> Result<()> {
         let mut fetched_urls = HashSet::new();
         let mut db = self.load_db()?;
 
-        info!("Fetching...");
         // Temporarily hardcode `dpc`'s proof-repo url
         let dpc_url = "https://github.com/dpc/crev-proofs";
-        if let Ok(dir) = self.fetch_remote_git(dpc_url).map_err(|e| warn!("{}", e)) {
+        if let Ok(dir) = self
+            .fetch_remote_git(dpc_url)
+            .map_err(|e| warnings.push(e.into()))
+        {
             let _ = self
                 .import_proof_dir_and_print_counts(&dir, dpc_url, &mut db)
-                .map_err(|e| warn!("{}", e));
+                .map_err(|e| warnings.push(e.into()));
         }
         fetched_urls.insert(dpc_url.to_owned());
 
@@ -1076,47 +1108,49 @@ impl Local {
                 continue;
             }
 
-            let url = match git2::Repository::open(&path) {
-                Ok(repo) => Self::url_for_repo(&repo),
-                Err(_) => continue,
+            let url = match Self::url_for_repo_at_path(&path) {
+                Ok(url) => url,
+                Err(e) => {
+                    warnings.push(Warning::NoRepoUrlAtPath(path, e));
+                    continue;
+                }
             };
 
-            match url {
-                Ok(url) => {
-                    let _ = self
-                        .get_fetch_source_for_url(Url::new_git(url))
-                        .map(|fetch_source| {
-                            db.import_from_iter(
-                                proofs_iter_for_path(path.clone())
-                                    .map(move |p| (p, fetch_source.clone())),
-                            );
-                        })
-                        .map_err(|e| warn!("{}", e));
-                }
-                Err(e) => {
-                    error!("in {}: {}", path.display(), e);
-                }
-            }
+            let _ = self
+                .get_fetch_source_for_url(Url::new_git(url))
+                .map(|fetch_source| {
+                    db.import_from_iter(
+                        proofs_iter_for_path(path.clone()).map(move |p| (p, fetch_source.clone())),
+                    );
+                })
+                .map_err(|e| warnings.push(e.into()));
         }
 
-        self.fetch_all_ids_recursively(fetched_urls, &mut db)?;
+        self.fetch_all_ids_recursively(fetched_urls, &mut db, warnings)?;
 
         Ok(())
     }
 
-    fn url_for_repo(repo: &git2::Repository) -> Result<String> {
+    pub fn url_for_repo_at_path(repo: &Path) -> Result<String> {
+        let repo = git2::Repository::open(repo)?;
         let remote = repo.find_remote("origin")?;
-        let url = remote.url().ok_or(Error::OriginHasNoURL)?;
+        let url = remote
+            .url()
+            .ok_or_else(|| Error::OriginHasNoURL(repo.path().into()))?;
         Ok(url.to_string())
     }
 
     /// Run arbitrary git command in `get_proofs_dir_path()`
-    pub fn run_git(&self, args: Vec<OsString>) -> Result<std::process::ExitStatus> {
+    pub fn run_git(
+        &self,
+        args: Vec<OsString>,
+        warnings: &mut Vec<Warning>,
+    ) -> Result<std::process::ExitStatus> {
         let proof_dir_path = self.get_proofs_dir_path()?;
         let id = self.read_current_locked_id()?;
         if let Some(u) = id.url {
             if !proof_dir_path.exists() {
-                self.clone_proof_dir_from_git(&u.url, false)?;
+                self.clone_proof_dir_from_git(&u.url, false, warnings)?;
             }
         } else {
             return Err(Error::GitUrlNotConfigured);
@@ -1137,23 +1171,6 @@ impl Local {
         config.open_cmd = Some(cmd);
         self.store_user_config(&config)?;
         Ok(())
-    }
-
-    /// Create a new proofdb, and populate it with local repo
-    /// and cache content.
-    pub fn load_db(&self) -> Result<crev_wot::ProofDB> {
-        let mut db = crev_wot::ProofDB::new();
-        for local_id in self.get_current_user_public_ids()? {
-            db.record_trusted_url_from_own_id(&local_id);
-        }
-        db.import_from_iter(
-            self.all_local_proofs()
-                .map(move |p| (p, crev_wot::FetchSource::LocalUser)),
-        );
-        db.import_from_iter(proofs_iter_for_remotes_checkouts(
-            self.cache_remotes_path(),
-        )?);
-        Ok(db)
     }
 
     /// The path must be inside `get_proofs_dir_path()`
@@ -1219,9 +1236,10 @@ impl Local {
         url: Option<&str>,
         use_https_push: bool,
         read_new_passphrase: impl FnOnce() -> std::io::Result<String>,
+        warnings: &mut Vec<Warning>,
     ) -> Result<id::LockedId> {
         if let Some(url) = url {
-            self.clone_proof_dir_from_git(url, use_https_push)?;
+            self.clone_proof_dir_from_git(url, use_https_push, warnings)?;
         }
 
         let unlocked_id = crev_data::id::UnlockedId::generate(url.map(crev_data::Url::new_git));
@@ -1229,7 +1247,7 @@ impl Local {
         let locked_id = id::LockedId::from_unlocked_id(&unlocked_id, &passphrase)?;
 
         if url.is_none() {
-            self.init_local_proofs_repo(&unlocked_id.id.id)?;
+            self.init_local_proofs_repo(&unlocked_id.id.id, warnings)?;
         }
 
         self.save_locked_id(&locked_id)?;
@@ -1286,7 +1304,7 @@ impl Local {
         let tmp_path = path_to_delete.with_file_name(file_name);
 
         let path_to_delete = match std::fs::rename(path_to_delete, &tmp_path) {
-            Ok(_) => &tmp_path,
+            Ok(()) => &tmp_path,
             Err(_) => path_to_delete,
         };
         let _ = std::fs::remove_dir_all(path_to_delete);
@@ -1404,10 +1422,10 @@ fn proofs_iter_for_path(path: PathBuf) -> impl Iterator<Item = proof::Proof> {
                             proof.signature(),
                             path.display(),
                             e
-                        )
+                        );
                     })
                     .ok()
-                    .map(|_| proof)
+                    .map(|()| proof)
             })),
             Err(e) => {
                 error!("Error parsing proofs in {}: {}", path.display(), e);
